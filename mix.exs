@@ -7,7 +7,8 @@ defmodule PastThePost.MixProject do
       version: "0.1.0",
       elixir: "~> 1.17",
       start_permanent: Mix.env() == :prod,
-      deps: deps()
+      deps: deps(),
+      aliases: aliases()
     ]
   end
 
@@ -28,6 +29,16 @@ defmodule PastThePost.MixProject do
       {:req, "~> 0.5"},
       {:oban, "~> 2.17"},
       {:jason, "~> 1.4"}
+    ]
+  end
+
+  # Aliases for common development tasks
+  defp aliases do
+    [
+      setup: ["deps.get", "ecto.setup", "validate.config"],
+      "ecto.setup": ["ecto.create", "ecto.migrate"],
+      "ecto.reset": ["ecto.drop", "ecto.setup"],
+      "validate.config": ["run -e 'PastThePost.ConfigValidator.validate!()' --no-start"]
     ]
   end
 end

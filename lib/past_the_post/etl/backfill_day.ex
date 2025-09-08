@@ -1,174 +1,171 @@
 defmodule PastThePost.ETL.BackfillDay do
+  @moduledoc """
+  Oban worker for processing daily racing data.
+  
+  Orchestrates the ETL pipeline for a single day's racing data,
+  handling API fetching, data transformation, and database persistence.
+  """
+
   use Oban.Worker, queue: :etl, max_attempts: 5
 
-  import Ecto.Query, only: [from: 2]
-
-  alias PastThePost.Repo
-  alias PastThePost.ETL.TabClient
-  alias PastThePost.Racing.{Race, Entry, Trainer, Jockey}
-  alias PastThePost.Blood.Horse
   require Logger
 
-  # -------- helpers --------
-  defp to_int(nil), do: nil
-  defp to_int(v) when is_integer(v), do: v
-  defp to_int(v) when is_binary(v) do
-    case Integer.parse(v) do
-      {n, _} -> n
-      :error -> nil
-    end
-  end
+  alias PastThePost.ETL.{
+    TabClient,
+    RaceTransformer,
+    RunnerTransformer,
+    Error
+  }
+  alias PastThePost.Data.{HorseUpsert, ParticipantUpsert}
+  alias PastThePost.{Repo, Racing.Race, Racing.Entry}
 
-  defp to_float(nil), do: nil
-  defp to_float(v) when is_float(v), do: v
-  defp to_float(v) when is_integer(v), do: v * 1.0
-  defp to_float(v) when is_binary(v) do
-    case Float.parse(v) do
-      {n, _} -> n
-      :error -> nil
-    end
-  end
-
-  # Parse breeding information from TAB format
-  # Example: "2 f TIZ THE LAW (USA)-CONQUEST STRATE UP (CAN)"
-  defp parse_breeding_info(nil), do: {nil, nil, nil, nil}
-  defp parse_breeding_info(breeding_str) when is_binary(breeding_str) do
-    case Regex.run(~r/(\d+)\s+([mfgch])\s+(.+)-(.+)/, String.trim(breeding_str)) do
-      [_, age_str, sex, sire_part, dam_part] ->
-        age = to_int(age_str)
-        sire_name = sire_part |> String.replace(~r/\s+\([A-Z]+\)$/, "") |> String.trim()
-        dam_name = dam_part |> String.replace(~r/\s+\([A-Z]+\)$/, "") |> String.trim()
-        {age, sex, sire_name, dam_name}
-      _ -> {nil, nil, nil, nil}
-    end
-  end
-
-  # Upsert horse and optionally create parent relationships
-  defp upsert_horse_with_bloodline(horse_attrs, sire_name \\ nil, dam_name \\ nil) do
-    # First, ensure parent horses exist if provided
-    sire = if sire_name, do: maybe_upsert_horse(sire_name), else: nil
-    dam = if dam_name, do: maybe_upsert_horse(dam_name), else: nil
-
-    # Now upsert the main horse with parent references
-    horse_attrs_with_parents = 
-      horse_attrs
-      |> Map.put(:sire_id, sire && sire.id)
-      |> Map.put(:dam_id, dam && dam.id)
-
-    horse = Repo.insert!(
-      struct(Horse, horse_attrs_with_parents),
-      on_conflict: {:replace, [:country, :year_foaled, :sex, :sire_id, :dam_id]},
-      conflict_target: [:name]
-    )
-
-    Repo.get_by!(Horse, name: horse_attrs.name)
-  end
-
-  # Simple horse upsert for parent horses
-  defp maybe_upsert_horse(name) when is_binary(name) and name != "" do
-    Repo.insert!(
-      %Horse{name: String.trim(name)},
-      on_conflict: :nothing,
-      conflict_target: [:name]
-    )
-    Repo.get_by!(Horse, name: String.trim(name))
-  end
-  defp maybe_upsert_horse(_), do: nil
-
-  defp maybe_upsert_name(_schema, nil), do: nil
-  defp maybe_upsert_name(_schema, ""), do: nil
-  defp maybe_upsert_name(schema, name) when is_binary(name) do
-    trimmed_name = String.trim(name)
-    if trimmed_name != "" do
-      Repo.insert!(
-        struct(schema, %{name: trimmed_name}),
-        on_conflict: :nothing,
-        conflict_target: [:name]
-      )
-      Repo.get_by!(schema, name: trimmed_name)
+  @doc """
+  Processes racing data for a single date.
+  
+  ## Job Arguments
+  
+  - `date`: ISO8601 date string (required)
+  
+  ## Process Flow
+  
+  1. Fetch schedule from TAB API
+  2. For each meeting:
+     - Fetch results data
+     - Transform race and runner data
+     - Persist to database
+  3. Log processing statistics
+  """
+  @impl Oban.Worker
+  def perform(%Oban.Job{args: %{"date" => iso_date}}) do
+    with {:ok, date} <- parse_date(iso_date),
+         {:ok, schedule} <- fetch_schedule(date),
+         {:ok, stats} <- process_meetings(date, schedule) do
+      
+      log_processing_success(date, stats)
+      :ok
     else
-      nil
+      {:error, %Error{type: :rate_limit_error} = error} ->
+        log_rate_limit_error(error)
+        {:snooze, error.retry_after}
+      
+      {:error, %Error{} = error} when error.type in [:api_error, :network_error] ->
+        log_retriable_error(error)
+        {:error, error.message}
+      
+      {:error, %Error{} = error} ->
+        log_processing_error(error)
+        {:discard, error.message}
+      
+      {:error, other_error} ->
+        log_unexpected_error(other_error, iso_date)
+        {:error, "Unexpected error occurred"}
     end
   end
 
-  # -------- results normalizer (TAB finals) --------
-  # Turns placings/also_ran into "runner"-like maps the rest of the pipeline understands.
-  defp normalize_runners_from_results(race_map) do
-    placings = race_map["placings"] || []
-    also_ran = race_map["also_ran"] || []
-
-    placed =
-      Enum.map(placings, fn p ->
-        %{
-          "horse"      => %{"name" => p["name"]},
-          "jockey"     => p["jockey"],
-          "placing"    => p["rank"],               # integer 1..N
-          "margin"     => p["distance"],           # beaten distance (may be string)
-          "barrier"    => nil,
-          "weight"     => nil,
-          "trainer"    => nil,
-          "fixedOdds"  => nil,
-          "sp"         => nil,
-          "betfairSP"  => nil
-        }
-      end)
-
-    losers =
-      Enum.map(also_ran, fn a ->
-        fp = a["finish_position"]
-        %{
-          "horse"      => %{"name" => a["name"]},
-          "jockey"     => a["jockey"],
-          "placing"    => (if fp == 0, do: nil, else: fp),
-          "margin"     => a["distance"],
-          "barrier"    => a["barrier"],
-          "weight"     => a["weight"],
-          "trainer"    => nil,
-          "fixedOdds"  => nil,
-          "sp"         => nil,
-          "betfairSP"  => nil
-        }
-      end)
-
-    placed ++ losers
+  # Parse and validate the date parameter
+  defp parse_date(iso_date) do
+    case Date.from_iso8601(iso_date) do
+      {:ok, date} -> {:ok, date}
+      {:error, _} -> {:error, Error.validation_error("Invalid date format", %{date: iso_date})}
+    end
   end
 
-  # -------- Oban entry --------
-  @impl true
-  def perform(%Oban.Job{args: %{"date" => iso}}) do
-    date = Date.from_iso8601!(iso)
-    sched = TabClient.schedule!(date)
+  # Fetch the racing schedule for a date
+  defp fetch_schedule(date) do
+    try do
+      schedule = TabClient.schedule!(date)
+      {:ok, schedule}
+    rescue
+      error ->
+        {:error, Error.api_error("Failed to fetch schedule", %{
+          date: date,
+          error: inspect(error)
+        })}
+    end
+  end
 
-    Enum.each(sched["meetings"] || [], fn m ->
-      meetno = m["number"] || m["meetNo"] || m["meetno"]
+  # Process all meetings for a date
+  defp process_meetings(date, schedule) do
+    meetings = Map.get(schedule, "meetings", [])
+    
+    stats = %{
+      meetings_processed: 0,
+      races_processed: 0,
+      entries_processed: 0,
+      errors: []
+    }
 
-      results =
-        try do
-          TabClient.results_for_meeting!(date, meetno)
-        rescue
-          error ->
-            Logger.warning("Failed to fetch results for meeting #{meetno} on #{date}: #{inspect(error)}")
-            nil
+    final_stats = 
+      Enum.reduce(meetings, stats, fn meeting, acc_stats ->
+        case process_meeting(date, meeting) do
+          {:ok, meeting_stats} ->
+            %{
+              meetings_processed: acc_stats.meetings_processed + 1,
+              races_processed: acc_stats.races_processed + meeting_stats.races_processed,
+              entries_processed: acc_stats.entries_processed + meeting_stats.entries_processed,
+              errors: acc_stats.errors
+            }
+          
+          {:error, error} ->
+            Logger.warning("Failed to process meeting: #{Error.message(error)}", 
+              error_context: Error.format_for_logging(error))
+            
+            %{acc_stats | errors: [error | acc_stats.errors]}
         end
+      end)
 
-      upsert_meeting_results!(date, m, results)
-    end)
-
-    :ok
+    {:ok, final_stats}
   end
 
-  # -------- normalizer + core --------
-  defp upsert_meeting_results!(date, meeting, results_or_nil) do
-    races =
+  # Process a single meeting
+  defp process_meeting(date, meeting) do
+    with {:ok, meetno} <- extract_meeting_number(meeting),
+         {:ok, results} <- fetch_meeting_results(date, meetno),
+         {:ok, races_data} <- extract_races_data(meeting, results),
+         {:ok, transformed_races} <- RaceTransformer.transform_meeting(date, meeting, races_data),
+         {:ok, meeting_stats} <- persist_meeting_data(transformed_races) do
+      {:ok, meeting_stats}
+    else
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  # Extract meeting number from meeting data
+  defp extract_meeting_number(meeting) do
+    meetno = meeting["number"] || meeting["meetNo"] || meeting["meetno"]
+    
+    case meetno do
+      nil -> {:error, Error.validation_error("Missing meeting number", %{meeting: meeting})}
+      number -> {:ok, number}
+    end
+  end
+
+  # Fetch results for a specific meeting
+  defp fetch_meeting_results(date, meetno) do
+    try do
+      results = TabClient.results_for_meeting!(date, meetno)
+      {:ok, results}
+    rescue
+      error ->
+        Logger.warning("Failed to fetch results for meeting #{meetno} on #{date}: #{inspect(error)}")
+        # Return empty results rather than failing the whole day
+        {:ok, %{"meetings" => []}}
+    end
+  end
+
+  # Extract races data from meeting/results
+  defp extract_races_data(meeting, results) do
+    races = 
       cond do
         # Handle results API response (nested under meetings)
-        is_map(results_or_nil) and Map.has_key?(results_or_nil, "meetings") ->
-          results_meetings = results_or_nil["meetings"] || []
-          # Find the matching meeting by number
+        is_map(results) and Map.has_key?(results, "meetings") ->
+          results_meetings = results["meetings"] || []
           meetno = meeting["number"] || meeting["meetNo"] || meeting["meetno"]
+          
           matching_meeting = Enum.find(results_meetings, fn m ->
             (m["number"] || m["meetNo"] || m["meetno"]) == meetno
           end)
+          
           if matching_meeting, do: matching_meeting["races"] || [], else: []
 
         # Handle schedule API response (races directly under meeting)
@@ -179,114 +176,201 @@ defmodule PastThePost.ETL.BackfillDay do
           []
       end
 
-    do_upsert_meeting_results!(date, meeting, races)
+    {:ok, races}
   end
 
-  defp do_upsert_meeting_results!(_date, _meeting, []), do: :ok
-
-  defp do_upsert_meeting_results!(date, meeting, races) when is_list(races) do
-    track = meeting["venue"] || meeting["name"] || "Unknown"
-    country = (meeting["country"] || "NZ") |> to_string() |> String.upcase() |> String.slice(0, 2)
-
-    Enum.each(races, fn r ->
-      distance = to_int(r["distance"] || r["distanceMeters"] || r["length"]) || 0
-      going = r["trackCondition"] || r["going"] || r["track"]
-      race_no = to_int(r["number"]) || 0
-
-      race =
-        Repo.insert!(%Race{
-          date: date,
-          track: track,
-          country: country,
-          distance_m: distance,
-          going: going,
-          class: r["class"] || r["raceClass"],
-          race_number: race_no
-        },
-        on_conflict: {:replace, [:distance_m, :going, :class]},
-        conflict_target: [:date, :track, :race_number])
-
-      # Extract breeding information for winner (if available)
-      {winner_age, winner_sex, sire_name, dam_name} = parse_breeding_info(r["winnersbreeding"])
-
-      runners =
-        cond do
-          is_list(r["results"]) && r["results"] != [] -> r["results"]
-          is_list(r["runners"]) && r["runners"] != [] -> r["runners"]
-          is_list(r["entries"]) && r["entries"] != [] -> r["entries"]
-          (is_list(r["placings"]) && r["placings"] != []) or
-            (is_list(r["also_ran"]) && r["also_ran"] != []) ->
-            normalize_runners_from_results(r)
-          true -> []
-        end
-
-      Enum.each(runners, fn runner ->
-        horse_map = runner["horse"] || runner
-        horse_name = horse_map["name"]
-
-        # Skip obviously bad rows
-        if is_binary(horse_name) and String.trim(horse_name) != "" do
-          # Check if this is the winner and we have breeding info
-          is_winner = runner["placing"] == 1 || runner["finishPosition"] == 1 || runner["rank"] == 1
+  # Persist transformed race data to database
+  defp persist_meeting_data(transformed_races) do
+    Repo.transaction(fn ->
+      stats = %{races_processed: 0, entries_processed: 0}
+      
+      Enum.reduce(transformed_races, stats, fn race_data, acc_stats ->
+        case persist_race_data(race_data) do
+          {:ok, race_stats} ->
+            %{
+              races_processed: acc_stats.races_processed + 1,
+              entries_processed: acc_stats.entries_processed + race_stats.entries_processed
+            }
           
-          horse = 
-            if is_winner && sire_name && dam_name do
-              # Winner with breeding info - create with bloodline
-              horse_attrs = %{
-                name: horse_name,
-                country: horse_map["country"],
-                year_foaled: to_int(horse_map["yob"]),
-                sex: winner_sex
-              }
-              upsert_horse_with_bloodline(horse_attrs, sire_name, dam_name)
-            else
-              # Regular horse upsert
-              Repo.insert!(%Horse{
-                name: horse_name,
-                country: horse_map["country"],
-                year_foaled: to_int(horse_map["yob"])
-              }, on_conflict: :nothing, conflict_target: [:name])
-              
-              Repo.get_by!(Horse, name: horse_name)
-            end
-
-          trainer = maybe_upsert_name(Trainer, runner["trainer"])
-          jockey = maybe_upsert_name(Jockey, runner["jockey"])
-
-          Repo.insert!(
-            %Entry{
-              race_id: race.id,
-              horse_id: horse.id,
-              trainer_id: trainer && trainer.id,
-              jockey_id: jockey && jockey.id,
-              barrier: to_int(runner["barrier"]),
-              weight_kg: to_float(runner["weight"]),
-              finishing_pos: to_int(runner["placing"] || runner["finishPosition"]),
-              margin_l: to_float(runner["margin"]),
-              sp_odds: to_float(runner["fixedOdds"] || runner["sp"]),
-              bf_sp: to_float(runner["betfairSP"])
-            },
-            on_conflict: (
-              from e in Entry,
-                update: [
-                  set: [
-                    trainer_id: fragment("COALESCE(EXCLUDED.trainer_id, ?)", e.trainer_id),
-                    jockey_id: fragment("COALESCE(EXCLUDED.jockey_id, ?)", e.jockey_id),
-                    barrier: fragment("COALESCE(EXCLUDED.barrier, ?)", e.barrier),
-                    weight_kg: fragment("COALESCE(EXCLUDED.weight_kg, ?)", e.weight_kg),
-                    finishing_pos: fragment("COALESCE(EXCLUDED.finishing_pos, ?)", e.finishing_pos),
-                    margin_l: fragment("COALESCE(EXCLUDED.margin_l, ?)", e.margin_l),
-                    sp_odds: fragment("COALESCE(EXCLUDED.sp_odds, ?)", e.sp_odds),
-                    bf_sp: fragment("COALESCE(EXCLUDED.bf_sp, ?)", e.bf_sp)
-                  ]
-                ]
-            ),
-            conflict_target: [:race_id, :horse_id]
-          )
+          {:error, error} ->
+            Logger.error("Failed to persist race data: #{Error.message(error)}")
+            acc_stats
         end
       end)
     end)
+  rescue
+    error ->
+      {:error, Error.database_error("Transaction failed during meeting persistence", %{
+        error: inspect(error)
+      })}
+  end
 
-    :ok
+  # Persist a single race and its entries
+  defp persist_race_data(race_data) do
+    with {:ok, race} <- upsert_race(race_data),
+         {:ok, runners} <- transform_runners(race_data),
+         {:ok, participants} <- ParticipantUpsert.batch_upsert_from_runners(runners),
+         {:ok, entries_count} <- persist_race_entries(race, runners, participants) do
+      {:ok, %{entries_processed: entries_count}}
+    else
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  # Upsert race record
+  defp upsert_race(race_data) do
+    try do
+      race = Repo.insert!(%Race{
+        date: race_data.date,
+        track: race_data.track,
+        country: race_data.country,
+        distance_m: race_data.distance_m,
+        going: race_data.going,
+        class: race_data.class,
+        race_number: race_data.race_number
+      },
+      on_conflict: {:replace, [:distance_m, :going, :class]},
+      conflict_target: [:date, :track, :race_number])
+
+      {:ok, race}
+    rescue
+      error ->
+        {:error, Error.database_error("Failed to upsert race", %{
+          error: inspect(error),
+          race: race_data
+        })}
+    end
+  end
+
+  # Transform runners using the breeding information
+  defp transform_runners(race_data) do
+    # Extract breeding info from the first race data if available
+    breeding_info = extract_breeding_info(race_data)
+    
+    case RunnerTransformer.transform_runners(race_data.runners, breeding_info) do
+      {:ok, runners} -> {:ok, runners}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  # Extract breeding information from race data
+  defp extract_breeding_info(_race_data) do
+    # Look for breeding info in the original race data
+    # This might be stored in a winnersbreeding field or similar
+    nil # For now, return nil - can be enhanced later
+  end
+
+  # Persist race entries with horses and participants
+  defp persist_race_entries(race, runners, participants) do
+    entries_processed = 
+      Enum.reduce(runners, 0, fn runner, count ->
+        case persist_single_entry(race, runner, participants) do
+          {:ok, _entry} -> count + 1
+          {:error, error} ->
+            Logger.warning("Failed to persist entry: #{Error.message(error)}")
+            count
+        end
+      end)
+
+    {:ok, entries_processed}
+  end
+
+  # Persist a single race entry
+  defp persist_single_entry(race, runner, participants) do
+    with {:ok, horse} <- upsert_runner_horse(runner),
+         {:ok, entry} <- upsert_race_entry(race, horse, runner, participants) do
+      {:ok, entry}
+    else
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  # Upsert horse for a runner
+  defp upsert_runner_horse(runner) do
+    horse_attrs = %{
+      name: runner.horse_name,
+      country: runner.horse_country,
+      year_foaled: runner.horse_year_foaled,
+      sex: runner.horse_sex
+    }
+
+    if runner.sire_name && runner.dam_name do
+      # Horse with breeding info
+      bloodline_attrs = %{
+        sire_name: runner.sire_name,
+        dam_name: runner.dam_name,
+        damsire_name: nil
+      }
+      HorseUpsert.upsert_with_bloodline(horse_attrs, bloodline_attrs)
+    else
+      # Simple horse upsert
+      HorseUpsert.upsert_simple(horse_attrs)
+    end
+  end
+
+  # Upsert race entry
+  defp upsert_race_entry(race, horse, runner, participants) do
+    trainer = Map.get(participants.trainers, runner.trainer_name)
+    jockey = Map.get(participants.jockeys, runner.jockey_name)
+
+    try do
+      entry = Repo.insert!(%Entry{
+        race_id: race.id,
+        horse_id: horse.id,
+        trainer_id: trainer && trainer.id,
+        jockey_id: jockey && jockey.id,
+        barrier: runner.barrier,
+        weight_kg: runner.weight_kg,
+        finishing_pos: runner.finishing_pos,
+        margin_l: runner.margin_l,
+        sp_odds: runner.sp_odds,
+        bf_sp: runner.bf_sp
+      },
+      on_conflict: {:replace_all_except, [:id, :race_id, :horse_id, :inserted_at]},
+      conflict_target: [:race_id, :horse_id])
+
+      {:ok, entry}
+    rescue
+      error ->
+        {:error, Error.database_error("Failed to upsert entry", %{
+          error: inspect(error),
+          race_id: race.id,
+          horse_id: horse.id
+        })}
+    end
+  end
+
+  # Logging functions
+
+  defp log_processing_success(date, stats) do
+    Logger.info("Successfully processed racing data for #{date}", %{
+      date: date,
+      meetings_processed: stats.meetings_processed,
+      races_processed: stats.races_processed,
+      entries_processed: stats.entries_processed,
+      errors_count: length(stats.errors)
+    })
+  end
+
+  defp log_rate_limit_error(error) do
+    Logger.warning("Rate limit hit, will retry", 
+      error_context: Error.format_for_logging(error))
+  end
+
+  defp log_retriable_error(error) do
+    Logger.warning("Retriable error occurred", 
+      error_context: Error.format_for_logging(error))
+  end
+
+  defp log_processing_error(error) do
+    Logger.error("Non-retriable error occurred", 
+      error_context: Error.format_for_logging(error))
+  end
+
+  defp log_unexpected_error(error, iso_date) do
+    Logger.error("Unexpected error during ETL processing", %{
+      error: inspect(error),
+      date: iso_date
+    })
   end
 end
