@@ -7,7 +7,16 @@ if config_env() == :dev do
     pool_size: 10
 end
 
-# Oban (if you set it earlier)
+if config_env() == :prod do
+  # Temporary hardcode - replace with env var later
+  config :past_the_post, PastThePost.Repo,
+    adapter: Ecto.Adapters.Postgres,
+    url: System.get_env("DATABASE_URL") || raise "DATABASE_URL environment variable is missing.",
+    pool_size: 10,
+    ssl: true,
+    ssl_opts: [verify: :verify_none]
+end
+
 config :past_the_post, Oban,
   repo: PastThePost.Repo,
   queues: [etl: 5]
