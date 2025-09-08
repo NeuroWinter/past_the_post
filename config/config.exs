@@ -11,3 +11,5 @@ config :past_the_post, PastThePost.Tab,
 config :past_the_post, Oban,
   repo: PastThePost.Repo,
   queues: [etl: 5]
+
+import_config "#{config_env()}.exs"

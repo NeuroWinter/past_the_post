@@ -1,3 +1,4 @@
+import Config
 config :past_the_post, PastThePost.Repo,
   username: "postgres",
   password: "postgres",

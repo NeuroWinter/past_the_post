@@ -10,13 +10,15 @@ defmodule PastThePost.ETL.TabClient do
   defp get!(url) do
     resp =
       Req.get!(url,
-        retry: :unsafe,
+        retry: :transient,               # <- was :unsafe
+        retry_log_level: :warn,
         max_retries: @retries,
-        retry_delay: fn a -> trunc(:math.pow(2, a) * 100) end,
-        receive_timeout: 15_000
+        retry_delay: fn attempt -> trunc(:math.pow(2, attempt) * 200) end,
+        receive_timeout: 15_000,
+        headers: [{"user-agent", "past_the_post/0.1 (+https://github.com/yourname/past_the_post)"}]
       )
+
     Process.sleep(@rate)
     resp.body
   end
 end
-
