@@ -1,0 +1,22 @@
+version: "3.8"
+
+services:
+  migrate:
+    build: .
+    environment:
+      MIX_ENV: prod
+      DATABASE_URL: ${DATABASE_URL}
+    command: ["mix", "ecto.migrate"]
+    restart: "no"
+
+  etl:
+    build: .
+    environment:
+      MIX_ENV: prod
+      DATABASE_URL: ${DATABASE_URL}
+    command: ["iex", "-S", "mix"]
+    stdin_open: true
+    tty: true
+    depends_on:
+      - migrate
+    restart: unless-stopped
