@@ -1,4 +1,8 @@
+.elixir-tools/
+.elixir_ls/
+.env
+.env.*
+.env.prod
 _build/
 deps/
-.elixir_ls/
 erl_crash.dump
